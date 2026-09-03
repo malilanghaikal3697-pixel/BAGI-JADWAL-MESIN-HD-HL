@@ -344,10 +344,27 @@ export class FairSchedulerEngine {
       const dailyList = dateMap.get(dateStr) || [];
       const dayNum = parseInt(dateStr.split('-')[2] || `${dayIdx + 1}`, 10);
 
+      // Deduplicate daily assignments by nurseId to ensure at most 1 assignment per nurse per date
+      const uniqueDailyMap = new Map<number, ShiftAssignment>();
+      dailyList.forEach((a) => {
+        const nId = Number(a.nurseId);
+        const existing = uniqueDailyMap.get(nId);
+        if (!existing) {
+          uniqueDailyMap.set(nId, a);
+        } else {
+          const isCurrentWorking = a.shiftType === 'PAGI' || a.shiftType === 'SIANG';
+          const isExistingWorking = existing.shiftType === 'PAGI' || existing.shiftType === 'SIANG';
+          if (isCurrentWorking && !isExistingWorking) {
+            uniqueDailyMap.set(nId, a);
+          }
+        }
+      });
+      const cleanDailyList = Array.from(uniqueDailyMap.values());
+
       // Separate Pagi and Siang working nurses
-      const pagiAssignments = dailyList.filter((a) => a.shiftType === 'PAGI');
-      const siangAssignments = dailyList.filter((a) => a.shiftType === 'SIANG');
-      const otherDaily = dailyList.filter((a) => a.shiftType !== 'PAGI' && a.shiftType !== 'SIANG');
+      const pagiAssignments = cleanDailyList.filter((a) => a.shiftType === 'PAGI');
+      const siangAssignments = cleanDailyList.filter((a) => a.shiftType === 'SIANG');
+      const otherDaily = cleanDailyList.filter((a) => a.shiftType !== 'PAGI' && a.shiftType !== 'SIANG');
 
       const pagiNurses = pagiAssignments.map(getOrCreateNurse);
       const siangNurses = siangAssignments.map(getOrCreateNurse);
@@ -437,20 +454,33 @@ export class FairSchedulerEngine {
   ): Record<number, number[]> {
     if (nursesOnShift.length === 0 || activeMachines.length === 0) return {};
 
-    // Strictly filter to active machines only
-    const strictlyActiveMachines = activeMachines.filter(
-      (m) =>
-        (m.status || 'AKTIF').toUpperCase() === 'AKTIF' &&
+    // Strictly filter to active machines only (case-insensitive and trimmed)
+    const strictlyActiveMachines = activeMachines.filter((m) => {
+      const statusUpper = (m.status || 'AKTIF').trim().toUpperCase();
+      return (
+        statusUpper === 'AKTIF' &&
         m.status !== 'MAINTENANCE' &&
         m.status !== 'RUSAK' &&
         m.status !== 'TIDAK_DIGUNAKAN'
-    );
+      );
+    });
     if (strictlyActiveMachines.length === 0) return {};
 
-    const numNurses = nursesOnShift.length;
+    // Deduplicate nurses by nurse.id so each nurse appears exactly once on shift
+    const uniqueNursesMap = new Map<number, Nurse>();
+    for (const n of nursesOnShift) {
+      const nId = Number(n.id);
+      if (!uniqueNursesMap.has(nId)) {
+        uniqueNursesMap.set(nId, n);
+      }
+    }
+    const cleanNursesOnShift = Array.from(uniqueNursesMap.values());
+    if (cleanNursesOnShift.length === 0) return {};
+
+    const numNurses = cleanNursesOnShift.length;
     const numMachines = strictlyActiveMachines.length;
     const sortedActiveMachines = WhatsAppDispatcher.getSortedMachines(strictlyActiveMachines);
-    const sortedMachineIds = sortedActiveMachines.map((m) => m.id);
+    const sortedMachineIds = sortedActiveMachines.map((m) => Number(m.id));
 
     const baseCount = Math.floor(numMachines / numNurses);
     const remainder = numMachines % numNurses;
@@ -458,8 +488,8 @@ export class FairSchedulerEngine {
     // Check if leader should have 1 less machine
     let leaderNurseId: number | null = null;
     if (options.leaderLighterLoad) {
-      const leader = nursesOnShift.find((n) => n.role === 'KARU' || n.role === 'KATIM');
-      if (leader && numNurses > 3) {
+      const leader = cleanNursesOnShift.find((n) => n.role === 'KARU' || n.role === 'KATIM');
+      if (leader && numNurses > 3 && baseCount >= 2) {
         leaderNurseId = Number(leader.id);
       }
     }
@@ -468,7 +498,7 @@ export class FairSchedulerEngine {
     let assignedNurses: Nurse[] = [];
     if (options.shuffleNurses !== false) {
       // Fisher-Yates shuffle with fresh randomness for every generation
-      assignedNurses = [...nursesOnShift];
+      assignedNurses = [...cleanNursesOnShift];
       for (let i = assignedNurses.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         const temp = assignedNurses[i];
@@ -480,7 +510,7 @@ export class FairSchedulerEngine {
       const rotationOffset = options.rotateBays !== false
         ? (dayIndex + (shiftType === 'SIANG' ? 4 : 0)) % numNurses
         : 0;
-      assignedNurses = nursesOnShift.map((_, i) => nursesOnShift[(i + rotationOffset) % numNurses]);
+      assignedNurses = cleanNursesOnShift.map((_, i) => cleanNursesOnShift[(i + rotationOffset) % numNurses]);
     }
 
     // 2. Consecutive isolation protection:
@@ -503,7 +533,7 @@ export class FairSchedulerEngine {
 
     const luckyCount = Math.min(
       eligibleForExtra.length,
-      remainder + (leaderNurseId !== null ? 1 : 0)
+      remainder + (leaderNurseId !== null && remainder + 1 <= eligibleForExtra.length ? 1 : 0)
     );
     const luckyNursesForExtraMachine = new Set(
       eligibleForExtra.slice(0, luckyCount).map((n) => Number(n.id))
@@ -514,19 +544,25 @@ export class FairSchedulerEngine {
     });
 
     const allocation: Record<number, number[]> = {};
+    cleanNursesOnShift.forEach((n) => {
+      allocation[Number(n.id)] = [];
+      (allocation as Record<string | number, number[]>)[String(n.id)] = [];
+    });
+
     let machinePointer = 0;
 
     for (const nurse of assignedNurses) {
       const nurseIdNum = Number(nurse.id);
-      let countForThisNurse = luckyNursesForExtraMachine.has(nurseIdNum) ? baseCount + 1 : baseCount;
-      if (leaderNurseId !== null && nurseIdNum === leaderNurseId) {
-        countForThisNurse = Math.max(1, baseCount - 1);
+      let countForThisNurse = baseCount;
+      if (luckyNursesForExtraMachine.has(nurseIdNum)) {
+        countForThisNurse = baseCount + 1;
+      } else if (leaderNurseId !== null && nurseIdNum === leaderNurseId && baseCount >= 2) {
+        countForThisNurse = baseCount - 1;
       }
 
       const endIndex = Math.min(machinePointer + countForThisNurse, sortedMachineIds.length);
       const assigned = sortedMachineIds.slice(machinePointer, endIndex);
       allocation[nurseIdNum] = assigned;
-      // Mirror string key for flexible lookup
       (allocation as Record<string | number, number[]>)[String(nurse.id)] = assigned;
       machinePointer = endIndex;
 
@@ -542,11 +578,17 @@ export class FairSchedulerEngine {
       }
     }
 
-    // GUARANTEE: If any active machine remains unallocated (e.g. due to remainder or rounding),
-    // distribute it sequentially to the nurse who currently has the fewest allocated machines.
-    if (machinePointer < sortedMachineIds.length) {
-      const leftover = sortedMachineIds.slice(machinePointer);
-      leftover.forEach((mId) => {
+    // 4. GUARANTEE 100% ALLOCATION:
+    // Check if any active machine ID is missing from all nurses' allocations
+    const allocatedIdSet = new Set<number>();
+    for (const nurse of assignedNurses) {
+      const nId = Number(nurse.id);
+      (allocation[nId] || []).forEach((id) => allocatedIdSet.add(Number(id)));
+    }
+
+    const unallocatedIds = sortedMachineIds.filter((id) => !allocatedIdSet.has(Number(id)));
+    if (unallocatedIds.length > 0) {
+      for (const mId of unallocatedIds) {
         const sortedByLoad = [...assignedNurses].sort((a, b) => {
           const countA = (allocation[Number(a.id)] || []).length;
           const countB = (allocation[Number(b.id)] || []).length;
@@ -555,11 +597,26 @@ export class FairSchedulerEngine {
         const recipient = sortedByLoad[0] || assignedNurses[0];
         if (recipient) {
           const rId = Number(recipient.id);
-          if (!allocation[rId]) allocation[rId] = [];
-          allocation[rId].push(mId);
-          (allocation as Record<string | number, number[]>)[String(recipient.id)] = allocation[rId];
+          const current = allocation[rId] || [];
+          current.push(mId);
+          allocation[rId] = current;
+          (allocation as Record<string | number, number[]>)[String(recipient.id)] = current;
+          allocatedIdSet.add(mId);
         }
-      });
+      }
+    }
+
+    // 5. Final pass: Sort each nurse's machines by room layout sequence (A01..A12 -> C01..C04 -> B01..B09 -> C05..C09)
+    const strictlyActiveIdSet = new Set(strictlyActiveMachines.map((m) => Number(m.id)));
+    for (const nurse of cleanNursesOnShift) {
+      const nId = Number(nurse.id);
+      const rawIds = (allocation[nId] || []).filter((id) => strictlyActiveIdSet.has(Number(id)));
+      const machObjects = rawIds
+        .map((id) => strictlyActiveMachines.find((m) => Number(m.id) === Number(id)))
+        .filter(Boolean) as Machine[];
+      const sorted = WhatsAppDispatcher.getSortedMachines(machObjects).map((m) => Number(m.id));
+      allocation[nId] = sorted;
+      (allocation as Record<string | number, number[]>)[String(nurse.id)] = sorted;
     }
 
     return allocation;

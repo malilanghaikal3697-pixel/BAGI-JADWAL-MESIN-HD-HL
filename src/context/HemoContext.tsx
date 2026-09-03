@@ -476,7 +476,28 @@ export const HemoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         (snapshot) => {
           setIsCloudLoaded(true);
           if (!snapshot.empty) {
-            const cloudAssignments = snapshot.docs.map((d) => d.data() as ShiftAssignment);
+            const rawCloudAssignments = snapshot.docs.map((d) => d.data() as ShiftAssignment);
+            // Deduplicate assignments by (date, nurseId) so each nurse has at most 1 assignment per date
+            const dedupMap = new Map<string, ShiftAssignment>();
+            rawCloudAssignments.forEach((ca) => {
+              const key = `${ca.date}_${ca.nurseId}`;
+              const existing = dedupMap.get(key);
+              if (!existing) {
+                dedupMap.set(key, ca);
+              } else {
+                // Prefer assignment with working shift and allocated machines
+                const caWorking = ca.shiftType === 'PAGI' || ca.shiftType === 'SIANG';
+                const exWorking = existing.shiftType === 'PAGI' || existing.shiftType === 'SIANG';
+                const caMach = (ca.assignedMachineIds || []).length;
+                const exMach = (existing.assignedMachineIds || []).length;
+                if ((caWorking && !exWorking) || (caWorking === exWorking && caMach > exMach)) {
+                  dedupMap.set(key, ca);
+                }
+              }
+            });
+
+            const cloudAssignments = Array.from(dedupMap.values());
+
             setAssignments((prev) => {
               const prevMap = new Map<string, ShiftAssignment>();
               prev.forEach((a) => prevMap.set(a.id, a));
@@ -811,16 +832,33 @@ export const HemoProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         // Daily source: use existing assignments for this date or dailyAssignments fallback
         const existingDaily = assignments.filter((a) => a.date === date);
-        const dailySource =
+        const dailySourceRaw =
           existingDaily.length > 0
             ? existingDaily
             : date === selectedDate && dailyAssignments.length > 0
             ? dailyAssignments
             : [];
 
-        if (dailySource.length === 0) {
+        if (dailySourceRaw.length === 0) {
           generateSchedule(true);
         } else {
+          // Deduplicate daily assignments by nurseId, prioritizing working shifts
+          const uniqueDailyMap = new Map<number, ShiftAssignment>();
+          dailySourceRaw.forEach((a) => {
+            const nId = Number(a.nurseId);
+            const existing = uniqueDailyMap.get(nId);
+            if (!existing) {
+              uniqueDailyMap.set(nId, a);
+            } else {
+              const isWorking = a.shiftType === 'PAGI' || a.shiftType === 'SIANG';
+              const isExistingWorking = existing.shiftType === 'PAGI' || existing.shiftType === 'SIANG';
+              if (isWorking && !isExistingWorking) {
+                uniqueDailyMap.set(nId, a);
+              }
+            }
+          });
+          const dailySource = Array.from(uniqueDailyMap.values());
+
           const getOrCreateNurse = (a: ShiftAssignment): Nurse => {
             const found = nurses.find((n) => Number(n.id) === Number(a.nurseId));
             if (found) return found;
@@ -857,26 +895,38 @@ export const HemoProvider: React.FC<{ children: React.ReactNode }> = ({ children
             'SIANG'
           );
 
-          const updatedDailyMap = new Map<number | string, ShiftAssignment>();
-          dailySource.forEach((a) => {
+          const updatedDaily = dailySource.map((a) => {
             const nId = Number(a.nurseId);
-            let item = { ...a };
+            let assignedMachineIds: number[] = [];
             if (a.shiftType === 'PAGI') {
-              item.assignedMachineIds = pagiAlloc[nId] || (pagiAlloc as Record<string, number[]>)[String(a.nurseId)] || [];
+              assignedMachineIds = pagiAlloc[nId] || (pagiAlloc as Record<string, number[]>)[String(a.nurseId)] || [];
             } else if (a.shiftType === 'SIANG') {
-              item.assignedMachineIds = siangAlloc[nId] || (siangAlloc as Record<string, number[]>)[String(a.nurseId)] || [];
-            } else {
-              item.assignedMachineIds = [];
+              assignedMachineIds = siangAlloc[nId] || (siangAlloc as Record<string, number[]>)[String(a.nurseId)] || [];
             }
-            updatedDailyMap.set(nId, item);
+            return {
+              ...a,
+              assignedMachineIds,
+            };
           });
 
-          const updatedDaily = Array.from(updatedDailyMap.values());
           setAssignments((prev) => {
             const otherDates = prev.filter((a) => a.date !== date);
             return [...otherDates, ...updatedDaily];
           });
           syncBatchAssignmentsToCloud(updatedDaily);
+
+          // Clean up any stale duplicate docs from Firestore
+          const updatedIds = new Set(updatedDaily.map((a) => a.id));
+          const staleDocIds = existingDaily
+            .filter((a) => !updatedIds.has(a.id))
+            .map((a) => a.id);
+          staleDocIds.forEach(async (sId) => {
+            try {
+              await deleteDoc(doc(db, 'assignments', sId));
+            } catch (e) {
+              console.warn('Could not delete stale doc:', sId, e);
+            }
+          });
         }
         showToast(`Pembagian seluruh ${activeMachines.length} mesin aktif tanggal ${date} berhasil dialokasikan secara adil!`, 'success');
       } catch (err) {
@@ -913,17 +963,34 @@ export const HemoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
 
         const existingDaily = assignments.filter((a) => a.date === date);
-        const dailySource =
+        const dailySourceRaw =
           existingDaily.length > 0
             ? existingDaily
             : date === selectedDate && dailyAssignments.length > 0
             ? dailyAssignments
             : [];
 
-        if (dailySource.length === 0) {
+        if (dailySourceRaw.length === 0) {
           showToast(`Tidak ditemukan jadwal dinas pada tanggal ${date}. Buat jadwal terlebih dahulu.`, 'error');
           return;
         }
+
+        // Deduplicate daily assignments by nurseId, prioritizing working shifts
+        const uniqueDailyMap = new Map<number, ShiftAssignment>();
+        dailySourceRaw.forEach((a) => {
+          const nId = Number(a.nurseId);
+          const existing = uniqueDailyMap.get(nId);
+          if (!existing) {
+            uniqueDailyMap.set(nId, a);
+          } else {
+            const isWorking = a.shiftType === 'PAGI' || a.shiftType === 'SIANG';
+            const isExistingWorking = existing.shiftType === 'PAGI' || existing.shiftType === 'SIANG';
+            if (isWorking && !isExistingWorking) {
+              uniqueDailyMap.set(nId, a);
+            }
+          }
+        });
+        const dailySource = Array.from(uniqueDailyMap.values());
 
         const getOrCreateNurse = (a: ShiftAssignment): Nurse => {
           const found = nurses.find((n) => Number(n.id) === Number(a.nurseId));
@@ -980,28 +1047,39 @@ export const HemoProvider: React.FC<{ children: React.ReactNode }> = ({ children
           effectiveOptions
         );
 
-        const updatedDailyMap = new Map<number | string, ShiftAssignment>();
-        dailySource.forEach((a) => {
+        const updatedDaily = dailySource.map((a) => {
           const nId = Number(a.nurseId);
-          // Strictly preserve existing shiftType and nurse profile - only update machine allocation
-          let item = { ...a };
+          let assignedMachineIds: number[] = [];
           if (a.shiftType === 'PAGI') {
-            item.assignedMachineIds = pagiAlloc[nId] || (pagiAlloc as Record<string, number[]>)[String(a.nurseId)] || [];
+            assignedMachineIds = pagiAlloc[nId] || (pagiAlloc as Record<string, number[]>)[String(a.nurseId)] || [];
           } else if (a.shiftType === 'SIANG') {
-            item.assignedMachineIds = siangAlloc[nId] || (siangAlloc as Record<string, number[]>)[String(a.nurseId)] || [];
-          } else {
-            item.assignedMachineIds = [];
+            assignedMachineIds = siangAlloc[nId] || (siangAlloc as Record<string, number[]>)[String(a.nurseId)] || [];
           }
-          updatedDailyMap.set(nId, item);
+          return {
+            ...a,
+            assignedMachineIds,
+          };
         });
 
-        const updatedDaily = Array.from(updatedDailyMap.values());
         setAssignments((prev) => {
           const otherDates = prev.filter((a) => a.date !== date);
           return [...otherDates, ...updatedDaily];
         });
 
         syncBatchAssignmentsToCloud(updatedDaily);
+
+        // Clean up any stale duplicate docs from Firestore
+        const updatedIds = new Set(updatedDaily.map((a) => a.id));
+        const staleDocIds = existingDaily
+          .filter((a) => !updatedIds.has(a.id))
+          .map((a) => a.id);
+        staleDocIds.forEach(async (sId) => {
+          try {
+            await deleteDoc(doc(db, 'assignments', sId));
+          } catch (e) {
+            console.warn('Could not delete stale doc:', sId, e);
+          }
+        });
         showToast(
           `Alokasi ${activeMachines.length} mesin aktif tanggal ${date} berhasil digenerate ulang & perawat diacak adil tanpa merubah jadwal sif!`,
           'success'
@@ -1097,7 +1175,8 @@ export const HemoProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (replaceExisting) {
         // Remove all previous assignments for targetMonth and replace with imported, preserving specialDuty
         const existingMap = new Map<string, ShiftAssignment>();
-        assignments.filter((a) => a.date.startsWith(targetMonth)).forEach((a) => {
+        const existingForMonth = assignments.filter((a) => a.date.startsWith(targetMonth));
+        existingForMonth.forEach((a) => {
           existingMap.set(`${a.date}-${a.nurseId}`, a);
         });
 
@@ -1114,6 +1193,19 @@ export const HemoProvider: React.FC<{ children: React.ReactNode }> = ({ children
         combined = [...others, ...preservedImported];
         setAssignments(combined);
         syncBatchAssignmentsToCloud(preservedImported);
+
+        // Clean up old documents for targetMonth from Firestore whose IDs are not in preservedImported
+        const newIds = new Set(preservedImported.map((a) => a.id));
+        const oldDocIds = existingForMonth
+          .filter((a) => !newIds.has(a.id))
+          .map((a) => a.id);
+        oldDocIds.forEach(async (oldId) => {
+          try {
+            await deleteDoc(doc(db, 'assignments', oldId));
+          } catch (e) {
+            console.warn('Could not delete old assignment during import replacement:', oldId, e);
+          }
+        });
       } else {
         // Merge: replace only matching IDs/dates
         const importMap = new Map<string, ShiftAssignment>();
